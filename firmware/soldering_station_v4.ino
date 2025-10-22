@@ -49,7 +49,9 @@
 #define PIN_SSR_TOP     21
 #define PIN_SSR_BOTTOM  47
 #define PIN_SSR_IR      48
-#define PIN_FAN         14
+#define PIN_FAN         14  // Cooling fan
+#define PIN_TOP_FAN     16  // Top heating fan (PWM)
+#define PIN_BOTTOM_FAN  17  // Bottom heating fan (PWM)
 #define PIN_LED         2
 #define PIN_SD_CS       10  // SPI2
 #define PIN_BUTTON_START 0
@@ -120,6 +122,8 @@ struct Phase {
   bool useTop;
   bool useBottom; 
   bool useIR;
+  float topFanSpeed;    // Скорость верхнего фена (0-100%)
+  float bottomFanSpeed; // Скорость нижнего фена (0-100%)
 };
 
 const int MAX_PHASES = 10;
@@ -144,6 +148,11 @@ uint8_t currentPhase = 0;
 uint32_t phaseStartMs = 0, procStartMs = 0;
 float tempTop = 0, tempBottom = 0, tempIR = 0, tempExternal = 0;
 float outTop = 0, outBottom = 0, outIR = 0;
+
+// -------- Управление вентиляторами нагрева --------
+float topFanSpeed = 0;      // Скорость верхнего фена (0-100%)
+float bottomFanSpeed = 0;   // Скорость нижнего фена (0-100%)
+bool fansEnabled = false;   // Флажок включения фенов
 
 // -------- PID контроллеры с автонастройкой --------
 struct PID {
@@ -174,6 +183,37 @@ struct ButtonState {
   uint32_t debounceTime = 50;
 };
 ButtonState startButton, stopButton;
+
+// -------- Управление вентиляторами нагрева --------
+void setHeatingFans(float topSpeed = 50, float bottomSpeed = 50) {
+  // Фены работают ВСЕГДА, только меняется скорость
+  topFanSpeed = constrain(topSpeed, 0, 100);
+  bottomFanSpeed = constrain(bottomSpeed, 0, 100);
+  
+  // PWM управление (0-255)
+  analogWrite(PIN_TOP_FAN, (int)(topFanSpeed * 2.55));
+  analogWrite(PIN_BOTTOM_FAN, (int)(bottomFanSpeed * 2.55));
+  
+  Serial.println("Fan speeds set - Top: " + String(topFanSpeed) + "%, Bottom: " + String(bottomFanSpeed) + "%");
+}
+
+void setHeatingFansForCooling(float coolingRate = 2.0) {
+  // Настройка скорости фенов для контролируемого охлаждения
+  // coolingRate: 1.0 = медленное, 3.0 = быстрое охлаждение
+  
+  if (coolingRate <= 1.5) {
+    // Медленное охлаждение - низкая скорость фенов
+    setHeatingFans(20, 20);
+  } else if (coolingRate <= 2.5) {
+    // Умеренное охлаждение - средняя скорость фенов
+    setHeatingFans(40, 40);
+  } else {
+    // Быстрое охлаждение - высокая скорость фенов
+    setHeatingFans(60, 60);
+  }
+  
+  Serial.println("Cooling fans set for rate: " + String(coolingRate) + "°C/sec");
+}
 
 // -------- Звуковые сигналы --------
 void beep(int duration = 200) {
@@ -367,10 +407,15 @@ void startProcess() {
   ssrWindowStart = millis();
   applyPhasePIDCoeffs();
   outTop = outBottom = outIR = 0;
+  
+  // Устанавливаем скорость фенов для первой фазы
+  Phase &phase = currentPreset.phases[currentPhase];
+  setHeatingFans(phase.topFanSpeed, phase.bottomFanSpeed);
+  
   digitalWrite(PIN_LED, HIGH);
   openLog();
   beep();
-  Serial.println("Process started");
+  Serial.println("Process started - fans set for phase: " + phase.name);
 }
 
 void stopProcess(bool aborted) {
@@ -381,14 +426,19 @@ void stopProcess(bool aborted) {
   digitalWrite(PIN_SSR_IR, LOW);
   digitalWrite(PIN_FAN, LOW);
   digitalWrite(PIN_LED, LOW);
+  
+  // Фены продолжают работать для охлаждения
+  // Устанавливаем скорость для финального охлаждения
+  setHeatingFansForCooling(2.0); // Умеренное охлаждение
+  
   closeLog();
   
   if (aborted) {
     beepSequence(5);
-    Serial.println("Process aborted");
+    Serial.println("Process aborted - fans continue for cooling");
   } else {
     beepSequence(3);
-    Serial.println("Process completed");
+    Serial.println("Process completed - fans continue for cooling");
   }
 }
 
@@ -400,8 +450,32 @@ void nextPhase() {
   }
   phaseStartMs = millis();
   applyPhasePIDCoeffs();
+  
+  // Управление вентиляторами нагрева и охлаждения
+  Phase &phase = currentPreset.phases[currentPhase];
+  
+  // Проверяем, это фаза охлаждения?
+  if (phase.name.indexOf("Cool") >= 0 || phase.name.indexOf("cool") >= 0) {
+    // Фаза охлаждения - выключаем нагреватели, настраиваем фены для охлаждения
+    digitalWrite(PIN_SSR_TOP, LOW);
+    digitalWrite(PIN_SSR_BOTTOM, LOW);
+    digitalWrite(PIN_SSR_IR, LOW);
+    
+    // Включаем вентилятор охлаждения стола
+    digitalWrite(PIN_FAN, HIGH);
+    
+    // Настраиваем фены для контролируемого охлаждения
+    setHeatingFansForCooling(2.0); // Умеренное охлаждение
+    
+    Serial.println("Cooling phase started - heaters OFF, fans + cooling fan ON");
+  } else {
+    // Обычная фаза - устанавливаем скорость фенов по профилю
+    setHeatingFans(phase.topFanSpeed, phase.bottomFanSpeed);
+  }
+  
   beep();
-  Serial.println("Phase " + String(currentPhase + 1) + ": " + currentPreset.phases[currentPhase].name);
+  Serial.println("Phase " + String(currentPhase + 1) + ": " + phase.name + 
+                 " - Top fan: " + String(topFanSpeed) + "%, Bottom fan: " + String(bottomFanSpeed) + "%");
 }
 
 // -------- Управление профилями --------
@@ -410,27 +484,27 @@ void loadDefaultProfiles() {
   profiles[0].name = "Lead-Free BGA";
   profiles[0].n = 4;
   profiles[0].overLimitC = 280.0;
-  profiles[0].phases[0] = {"Preheat", 165, 90, 2.0, 0.08, true, true, true};
-  profiles[0].phases[1] = {"Soak", 190, 60, 2.1, 0.09, true, true, true};
-  profiles[0].phases[2] = {"Reflow", 255, 30, 2.5, 0.10, true, false, false};
-  profiles[0].phases[3] = {"Cool", 100, 90, 1.0, 0.05, false, false, false};
+  profiles[0].phases[0] = {"Preheat", 165, 90, 2.0, 0.08, true, true, true, 30, 30};
+  profiles[0].phases[1] = {"Soak", 190, 60, 2.1, 0.09, true, true, true, 40, 40};
+  profiles[0].phases[2] = {"Reflow", 255, 30, 2.5, 0.10, true, false, false, 60, 0};
+  profiles[0].phases[3] = {"Cool", 100, 90, 1.0, 0.05, false, false, false, 40, 40}; // Фены работают для охлаждения
   
   // Leaded BGA
   profiles[1].name = "Leaded BGA";
   profiles[1].n = 4;
   profiles[1].overLimitC = 260.0;
-  profiles[1].phases[0] = {"Preheat", 150, 90, 2.0, 0.08, true, true, true};
-  profiles[1].phases[1] = {"Soak", 180, 60, 2.1, 0.09, true, true, true};
-  profiles[1].phases[2] = {"Reflow", 240, 30, 2.5, 0.10, true, false, false};
-  profiles[1].phases[3] = {"Cool", 100, 90, 1.0, 0.05, false, false, false};
+  profiles[1].phases[0] = {"Preheat", 150, 90, 2.0, 0.08, true, true, true, 30, 30};
+  profiles[1].phases[1] = {"Soak", 180, 60, 2.1, 0.09, true, true, true, 40, 40};
+  profiles[1].phases[2] = {"Reflow", 240, 30, 2.5, 0.10, true, false, false, 60, 0};
+  profiles[1].phases[3] = {"Cool", 100, 90, 1.0, 0.05, false, false, false, 40, 40}; // Фены работают для охлаждения
   
   // SMD Light
   profiles[2].name = "SMD Light";
   profiles[2].n = 3;
   profiles[2].overLimitC = 250.0;
-  profiles[2].phases[0] = {"Preheat", 140, 60, 1.8, 0.07, true, true, true};
-  profiles[2].phases[1] = {"Reflow", 230, 20, 2.2, 0.09, true, false, false};
-  profiles[2].phases[2] = {"Cool", 100, 60, 1.0, 0.05, false, false, false};
+  profiles[2].phases[0] = {"Preheat", 140, 60, 1.8, 0.07, true, true, true, 20, 20};
+  profiles[2].phases[1] = {"Reflow", 230, 20, 2.2, 0.09, true, false, false, 50, 0};
+  profiles[2].phases[2] = {"Cool", 100, 60, 1.0, 0.05, false, false, false, 30, 30}; // Фены работают для охлаждения
   
   totalProfiles = 3;
   currentProfileIndex = 0;
@@ -581,6 +655,8 @@ const char* INDEX_HTML = R"HTML(
             <div>Фаза: <b id="phaseName">-</b></div>
             <div>Осталось: <b id="remainTime">-</b> сек</div>
             <div>Выходы: <b id="outputs">0/0/0</b>%</div>
+            <div>Фены: <b id="heatingFans">ВЫКЛ</b></div>
+            <div>Охлаждение: <b id="fanStatus">ВЫКЛ</b></div>
             <div>Профиль: <b id="currentProfile">-</b></div>
         </div>
     </div>
@@ -651,6 +727,8 @@ const char* INDEX_HTML = R"HTML(
                     document.getElementById('phaseName').textContent = data.phase;
                     document.getElementById('remainTime').textContent = data.remain;
                     document.getElementById('outputs').textContent = data.outputs.top + '/' + data.outputs.bottom + '/' + data.outputs.ir;
+                    document.getElementById('heatingFans').textContent = data.heatingFans || 'ВЫКЛ';
+                    document.getElementById('fanStatus').textContent = data.fanStatus || 'ВЫКЛ';
                     document.getElementById('currentProfile').textContent = data.currentProfile;
                     document.getElementById('state').textContent = data.state;
 
@@ -778,6 +856,12 @@ void handleApiStatus() {
   outputs["bottom"] = outBottom;
   outputs["ir"] = outIR;
   
+  // Состояние вентиляторов
+  doc["fanStatus"] = digitalRead(PIN_FAN) ? "ВКЛ" : "ВЫКЛ";
+  
+  // Состояние фенов нагрева - фены работают всегда
+  doc["heatingFans"] = "ВКЛ (" + String((int)topFanSpeed) + "/" + String((int)bottomFanSpeed) + "%)";
+  
   JsonArray thermocouples = doc["thermocouples"].to<JsonArray>();
   for (int i = 0; i < 4; i++) {
     JsonObject tc = thermocouples.add<JsonObject>();
@@ -808,6 +892,14 @@ void handleApiFan() {
   static bool fanOn = false;
   fanOn = !fanOn;
   digitalWrite(PIN_FAN, fanOn ? HIGH : LOW);
+  
+  // Логирование состояния вентилятора
+  if (fanOn) {
+    Serial.println("Cooling fan manually activated");
+  } else {
+    Serial.println("Cooling fan manually deactivated");
+  }
+  
   server.send(200, "application/json", fanOn ? "{\"status\":\"fan on\"}" : "{\"status\":\"fan off\"}");
 }
 
@@ -925,17 +1017,25 @@ void setup() {
   pinMode(PIN_SSR_BOTTOM, OUTPUT);
   pinMode(PIN_SSR_IR, OUTPUT);
   pinMode(PIN_FAN, OUTPUT);
+  pinMode(PIN_TOP_FAN, OUTPUT);
+  pinMode(PIN_BOTTOM_FAN, OUTPUT);
   pinMode(PIN_LED, OUTPUT);
   pinMode(PIN_BUZZER, OUTPUT);
   pinMode(PIN_BUTTON_START, INPUT_PULLUP);
   pinMode(PIN_BUTTON_STOP, INPUT_PULLUP);
   
+  // Инициализация всех выходов в выключенное состояние
   digitalWrite(PIN_SSR_TOP, LOW);
   digitalWrite(PIN_SSR_BOTTOM, LOW);
   digitalWrite(PIN_SSR_IR, LOW);
   digitalWrite(PIN_FAN, LOW);
+  digitalWrite(PIN_TOP_FAN, LOW);
+  digitalWrite(PIN_BOTTOM_FAN, LOW);
   digitalWrite(PIN_LED, LOW);
   digitalWrite(PIN_BUZZER, LOW);
+  
+  // Инициализация PWM для фенов нагрева - фены работают всегда
+  setHeatingFans(30, 30); // 30% скорость по умолчанию в режиме ожидания
 
   // Загрузка профилей
   loadProfiles();
