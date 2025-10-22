@@ -71,6 +71,9 @@ WebServer server(80);
 String wifiMode = "ap";
 String wifiSsid = "ZM-R5860";
 String wifiPass = "reflow123";
+String deviceHostname = "ZM-R5860";
+bool wifiConfigured = false;
+bool showWifiSetup = true;
 
 // -------- GitHub интеграция --------
 const String GITHUB_OWNER = "PavelS2180";
@@ -268,6 +271,77 @@ void debugInfo(String message) { debugLog("INFO", message); }
 void debugWarn(String message) { debugLog("WARN", message); }
 void debugError(String message) { debugLog("ERROR", message); }
 void debugDebug(String message) { debugLog("DEBUG", message); }
+
+// -------- WiFi настройки --------
+void saveWifiSettings() {
+  ensureFS();
+  fs::FS &fs = activeFS();
+  File file = fs.open("/wifi_config.json", FILE_WRITE);
+  
+  if (file) {
+    JsonDocument doc;
+    doc["mode"] = wifiMode;
+    doc["ssid"] = wifiSsid;
+    doc["password"] = wifiPass;
+    doc["hostname"] = deviceHostname;
+    doc["configured"] = wifiConfigured;
+    
+    serializeJson(doc, file);
+    file.close();
+    debugInfo("WiFi settings saved");
+  } else {
+    debugError("Failed to save WiFi settings");
+  }
+}
+
+void loadWifiSettings() {
+  ensureFS();
+  fs::FS &fs = activeFS();
+  
+  if (fs.exists("/wifi_config.json")) {
+    File file = fs.open("/wifi_config.json", FILE_READ);
+    if (file) {
+      JsonDocument doc;
+      deserializeJson(doc, file);
+      
+      wifiMode = doc["mode"].as<String>();
+      wifiSsid = doc["ssid"].as<String>();
+      wifiPass = doc["password"].as<String>();
+      deviceHostname = doc["hostname"].as<String>();
+      wifiConfigured = doc["configured"].as<bool>();
+      
+      file.close();
+      debugInfo("WiFi settings loaded: " + wifiMode + " - " + wifiSsid);
+    }
+  } else {
+    debugInfo("No WiFi config found, using defaults");
+  }
+}
+
+// -------- WiFi сканирование --------
+String scanWiFiNetworks() {
+  debugInfo("Scanning WiFi networks...");
+  
+  int n = WiFi.scanNetworks();
+  if (n == 0) {
+    debugWarn("No networks found");
+    return "[]";
+  }
+  
+  String networks = "[";
+  for (int i = 0; i < n; i++) {
+    if (i > 0) networks += ",";
+    networks += "{";
+    networks += "\"ssid\":\"" + WiFi.SSID(i) + "\",";
+    networks += "\"rssi\":" + String(WiFi.RSSI(i)) + ",";
+    networks += "\"encryption\":" + String(WiFi.encryptionType(i) != WIFI_AUTH_OPEN ? "true" : "false");
+    networks += "}";
+  }
+  networks += "]";
+  
+  debugInfo("Found " + String(n) + " networks");
+  return networks;
+}
 
 // -------- Автоматическое обновление с GitHub --------
 bool checkForUpdates() {
@@ -844,6 +918,393 @@ void updateButtons() {
 }
 
 // -------- HTML интерфейс --------
+const char* WIFI_SETUP_HTML = R"HTML(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ZM-R5860 - Настройка WiFi</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            padding: 40px;
+            max-width: 500px;
+            width: 100%;
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        .logo {
+            font-size: 2.5em;
+            font-weight: bold;
+            color: #333;
+            margin-bottom: 10px;
+        }
+        .subtitle {
+            color: #666;
+            font-size: 1.1em;
+        }
+        .mode-selector {
+            margin-bottom: 30px;
+        }
+        .mode-option {
+            display: flex;
+            align-items: center;
+            padding: 15px;
+            margin: 10px 0;
+            border: 2px solid #e0e0e0;
+            border-radius: 10px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        .mode-option:hover {
+            border-color: #667eea;
+            background: #f8f9ff;
+        }
+        .mode-option.selected {
+            border-color: #667eea;
+            background: #f0f4ff;
+        }
+        .mode-option input[type="radio"] {
+            margin-right: 15px;
+            transform: scale(1.2);
+        }
+        .mode-info {
+            flex: 1;
+        }
+        .mode-title {
+            font-weight: bold;
+            color: #333;
+            margin-bottom: 5px;
+        }
+        .mode-desc {
+            color: #666;
+            font-size: 0.9em;
+        }
+        .wifi-form {
+            display: none;
+            margin-top: 20px;
+        }
+        .wifi-form.active {
+            display: block;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: bold;
+            color: #333;
+        }
+        .form-group input, .form-group select {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 16px;
+            transition: border-color 0.3s ease;
+        }
+        .form-group input:focus, .form-group select:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        .btn {
+            width: 100%;
+            padding: 15px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 10px;
+            font-size: 16px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: transform 0.2s ease;
+        }
+        .btn:hover {
+            transform: translateY(-2px);
+        }
+        .btn:active {
+            transform: translateY(0);
+        }
+        .btn-secondary {
+            background: #6c757d;
+            margin-top: 10px;
+        }
+        .status {
+            margin-top: 20px;
+            padding: 15px;
+            border-radius: 8px;
+            text-align: center;
+            font-weight: bold;
+        }
+        .status.success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .status.error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        .status.info {
+            background: #d1ecf1;
+            color: #0c5460;
+            border: 1px solid #bee5eb;
+        }
+        .scan-btn {
+            background: #28a745;
+            margin-bottom: 15px;
+        }
+        .network-list {
+            max-height: 200px;
+            overflow-y: auto;
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            margin-bottom: 15px;
+        }
+        .network-item {
+            padding: 10px;
+            border-bottom: 1px solid #e0e0e0;
+            cursor: pointer;
+            transition: background 0.2s ease;
+        }
+        .network-item:hover {
+            background: #f8f9ff;
+        }
+        .network-item:last-child {
+            border-bottom: none;
+        }
+        .network-name {
+            font-weight: bold;
+            color: #333;
+        }
+        .network-signal {
+            color: #666;
+            font-size: 0.9em;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="logo">🔧 ZM-R5860</div>
+            <div class="subtitle">Паяльная станция - Настройка подключения</div>
+        </div>
+
+        <div class="mode-selector">
+            <div class="mode-option" onclick="selectMode('wifi')">
+                <input type="radio" name="mode" value="wifi" id="wifi-mode">
+                <div class="mode-info">
+                    <div class="mode-title">🌐 Подключение к WiFi</div>
+                    <div class="mode-desc">Подключиться к существующей сети WiFi для удаленного управления</div>
+                </div>
+            </div>
+            
+            <div class="mode-option" onclick="selectMode('ap')">
+                <input type="radio" name="mode" value="ap" id="ap-mode" checked>
+                <div class="mode-info">
+                    <div class="mode-title">📡 Режим точки доступа</div>
+                    <div class="mode-desc">Создать собственную сеть для прямого подключения</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="wifi-form" id="wifi-form">
+            <button class="btn scan-btn" onclick="scanNetworks()">🔍 Сканировать сети</button>
+            
+            <div class="network-list" id="network-list" style="display: none;">
+                <!-- Список сетей будет загружен здесь -->
+            </div>
+
+            <div class="form-group">
+                <label for="ssid">Имя сети (SSID):</label>
+                <input type="text" id="ssid" placeholder="Введите имя WiFi сети">
+            </div>
+
+            <div class="form-group">
+                <label for="password">Пароль:</label>
+                <input type="password" id="password" placeholder="Введите пароль WiFi">
+            </div>
+
+            <div class="form-group">
+                <label for="hostname">Имя устройства в сети:</label>
+                <input type="text" id="hostname" value="ZM-R5860" placeholder="Имя для доступа по сети">
+            </div>
+        </div>
+
+        <div class="wifi-form active" id="ap-form">
+            <div class="form-group">
+                <label for="ap-ssid">Имя точки доступа:</label>
+                <input type="text" id="ap-ssid" value="ZM-R5860" placeholder="Имя сети">
+            </div>
+
+            <div class="form-group">
+                <label for="ap-password">Пароль:</label>
+                <input type="password" id="ap-password" value="reflow123" placeholder="Пароль для подключения">
+            </div>
+
+            <div class="form-group">
+                <label for="ap-hostname">Имя устройства:</label>
+                <input type="text" id="ap-hostname" value="ZM-R5860" placeholder="Имя устройства">
+            </div>
+        </div>
+
+        <button class="btn" onclick="saveSettings()">💾 Сохранить настройки</button>
+        <button class="btn btn-secondary" onclick="skipSetup()">⏭️ Пропустить настройку</button>
+
+        <div id="status"></div>
+    </div>
+
+    <script>
+        let selectedMode = 'ap';
+        let networks = [];
+
+        function selectMode(mode) {
+            selectedMode = mode;
+            
+            // Обновляем визуальное выделение
+            document.querySelectorAll('.mode-option').forEach(option => {
+                option.classList.remove('selected');
+            });
+            event.currentTarget.classList.add('selected');
+            
+            // Показываем/скрываем формы
+            document.getElementById('wifi-form').classList.toggle('active', mode === 'wifi');
+            document.getElementById('ap-form').classList.toggle('active', mode === 'ap');
+            
+            // Обновляем радиокнопки
+            document.getElementById('wifi-mode').checked = mode === 'wifi';
+            document.getElementById('ap-mode').checked = mode === 'ap';
+        }
+
+        function scanNetworks() {
+            showStatus('Сканирование сетей...', 'info');
+            
+            fetch('/api/scan-wifi')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        networks = data.networks;
+                        displayNetworks();
+                        showStatus(`Найдено ${networks.length} сетей`, 'success');
+                    } else {
+                        showStatus('Ошибка сканирования: ' + data.error, 'error');
+                    }
+                })
+                .catch(error => {
+                    showStatus('Ошибка подключения: ' + error, 'error');
+                });
+        }
+
+        function displayNetworks() {
+            const networkList = document.getElementById('network-list');
+            networkList.style.display = 'block';
+            networkList.innerHTML = '';
+
+            networks.forEach(network => {
+                const item = document.createElement('div');
+                item.className = 'network-item';
+                item.onclick = () => selectNetwork(network.ssid);
+                
+                item.innerHTML = `
+                    <div class="network-name">${network.ssid}</div>
+                    <div class="network-signal">Сигнал: ${network.rssi} dBm ${network.encryption ? '🔒' : '🔓'}</div>
+                `;
+                
+                networkList.appendChild(item);
+            });
+        }
+
+        function selectNetwork(ssid) {
+            document.getElementById('ssid').value = ssid;
+            showStatus(`Выбрана сеть: ${ssid}`, 'info');
+        }
+
+        function saveSettings() {
+            const settings = {
+                mode: selectedMode
+            };
+
+            if (selectedMode === 'wifi') {
+                settings.ssid = document.getElementById('ssid').value;
+                settings.password = document.getElementById('password').value;
+                settings.hostname = document.getElementById('hostname').value;
+                
+                if (!settings.ssid) {
+                    showStatus('Введите имя сети WiFi', 'error');
+                    return;
+                }
+            } else {
+                settings.ap_ssid = document.getElementById('ap-ssid').value;
+                settings.ap_password = document.getElementById('ap-password').value;
+                settings.ap_hostname = document.getElementById('ap-hostname').value;
+            }
+
+            showStatus('Сохранение настроек...', 'info');
+
+            fetch('/api/wifi-config', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(settings)
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    showStatus('Настройки сохранены! Перезагрузка...', 'success');
+                    setTimeout(() => {
+                        window.location.href = '/';
+                    }, 2000);
+                } else {
+                    showStatus('Ошибка сохранения: ' + data.error, 'error');
+                }
+            })
+            .catch(error => {
+                showStatus('Ошибка подключения: ' + error, 'error');
+            });
+        }
+
+        function skipSetup() {
+            showStatus('Переход к управлению...', 'info');
+            setTimeout(() => {
+                window.location.href = '/';
+            }, 1000);
+        }
+
+        function showStatus(message, type) {
+            const status = document.getElementById('status');
+            status.textContent = message;
+            status.className = `status ${type}`;
+            status.style.display = 'block';
+        }
+
+        // Инициализация
+        document.addEventListener('DOMContentLoaded', function() {
+            // Выбираем режим AP по умолчанию
+            selectMode('ap');
+        });
+    </script>
+</body>
+</html>
+)HTML";
+
 const char* INDEX_HTML = R"HTML(
 <!DOCTYPE html>
 <html>
@@ -913,6 +1374,7 @@ const char* INDEX_HTML = R"HTML(
             <button onclick="stopProcess()" id="stopBtn">Стоп</button>
             <button onclick="toggleFan()" id="fanBtn">Вентилятор</button>
             <button onclick="startAutotune()" id="autotuneBtn">Автонастройка PID</button>
+            <button onclick="window.location.href='/setup'" id="wifiBtn">🌐 WiFi</button>
             <a id="downloadLog" href="#" download style="display:none;">Скачать лог</a>
         </div>
     </div>
@@ -1256,6 +1718,105 @@ void handleApiDebugMode() {
   server.send(200, "application/json", responseStr);
 }
 
+void handleApiScanWifi() {
+  debugInfo("WiFi scan requested");
+  String networks = scanWiFiNetworks();
+  
+  JsonDocument doc;
+  doc["success"] = true;
+  doc["networks"] = networks;
+  
+  String response;
+  serializeJson(doc, response);
+  server.send(200, "application/json", response);
+}
+
+void handleApiWifiConfig() {
+  String body = server.arg("plain");
+  JsonDocument doc;
+  deserializeJson(doc, body);
+  
+  String mode = doc["mode"].as<String>();
+  
+  if (mode == "wifi") {
+    wifiMode = "wifi";
+    wifiSsid = doc["ssid"].as<String>();
+    wifiPass = doc["password"].as<String>();
+    deviceHostname = doc["hostname"].as<String>();
+    
+    debugInfo("WiFi config: " + wifiSsid + " - " + deviceHostname);
+    
+    // Попытка подключения к WiFi
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+    
+    // Ждем подключения до 10 секунд
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+      delay(500);
+      attempts++;
+      debugInfo("Connecting to WiFi... " + String(attempts));
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiConfigured = true;
+      showWifiSetup = false;
+      saveWifiSettings();
+      
+      JsonDocument response;
+      response["success"] = true;
+      response["message"] = "WiFi connected successfully";
+      response["ip"] = WiFi.localIP().toString();
+      
+      String responseStr;
+      serializeJson(response, responseStr);
+      server.send(200, "application/json", responseStr);
+      
+      debugInfo("WiFi connected: " + WiFi.localIP().toString());
+    } else {
+      // Возвращаемся в режим AP
+      WiFi.mode(WIFI_AP);
+      WiFi.softAP(wifiSsid.c_str(), wifiPass.c_str());
+      
+      JsonDocument response;
+      response["success"] = false;
+      response["error"] = "Failed to connect to WiFi network";
+      
+      String responseStr;
+      serializeJson(response, responseStr);
+      server.send(200, "application/json", responseStr);
+      
+      debugError("Failed to connect to WiFi");
+    }
+  } else {
+    // Режим AP
+    wifiMode = "ap";
+    wifiSsid = doc["ap_ssid"].as<String>();
+    wifiPass = doc["ap_password"].as<String>();
+    deviceHostname = doc["ap_hostname"].as<String>();
+    
+    debugInfo("AP config: " + wifiSsid + " - " + deviceHostname);
+    
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(wifiSsid.c_str(), wifiPass.c_str());
+    
+    wifiConfigured = true;
+    showWifiSetup = false;
+    saveWifiSettings();
+    
+    JsonDocument response;
+    response["success"] = true;
+    response["message"] = "AP mode configured";
+    response["ip"] = WiFi.softAPIP().toString();
+    
+    String responseStr;
+    serializeJson(response, responseStr);
+    server.send(200, "application/json", responseStr);
+    
+    debugInfo("AP mode configured: " + WiFi.softAPIP().toString());
+  }
+}
+
 // -------- OTA обновления --------
 void setupOTA() {
   ArduinoOTA.setHostname("ZM-R5860");
@@ -1317,15 +1878,18 @@ void setup() {
   // Инициализация PWM для фенов нагрева - фены работают всегда
   setHeatingFans(30, 30); // 30% скорость по умолчанию в режиме ожидания
 
-  // Загрузка профилей
-  loadProfiles();
-  
   // Инициализация файловой системы
   SPIFFS.begin(true);
   ensureFS();
+  
+  // Загрузка WiFi настроек
+  loadWifiSettings();
+  
+  // Загрузка профилей
+  loadProfiles();
 
   // Настройка WiFi
-  if (wifiMode == "sta") {
+  if (wifiMode == "wifi" && wifiConfigured) {
     WiFi.mode(WIFI_STA);
     WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
     uint32_t timeout = millis();
@@ -1335,22 +1899,31 @@ void setup() {
     if (WiFi.status() == WL_CONNECTED) {
       setupTime();
       Serial.println("WiFi connected: " + WiFi.localIP().toString());
+      showWifiSetup = false;
     } else {
       WiFi.mode(WIFI_AP);
-      WiFi.softAP("ZM-R5860", "reflow123");
-      Serial.println("AP mode: 192.168.4.1");
+      WiFi.softAP(wifiSsid.c_str(), wifiPass.c_str());
+      Serial.println("AP mode: " + WiFi.softAPIP().toString());
+      showWifiSetup = true;
     }
   } else {
     WiFi.mode(WIFI_AP);
-    WiFi.softAP("ZM-R5860", "reflow123");
-    Serial.println("AP mode: 192.168.4.1");
+    WiFi.softAP(wifiSsid.c_str(), wifiPass.c_str());
+    Serial.println("AP mode: " + WiFi.softAPIP().toString());
+    showWifiSetup = true;
   }
 
   // Настройка OTA
   setupOTA();
 
   // Настройка веб-сервера
-  server.on("/", []() { server.send(200, "text/html", INDEX_HTML); });
+  server.on("/", []() { 
+    if (showWifiSetup) {
+      server.send(200, "text/html", WIFI_SETUP_HTML);
+    } else {
+      server.send(200, "text/html", INDEX_HTML);
+    }
+  });
   server.on("/api/status", handleApiStatus);
   server.on("/api/start", HTTP_POST, handleApiStart);
   server.on("/api/stop", HTTP_POST, handleApiStop);
@@ -1361,6 +1934,9 @@ void setup() {
   server.on("/api/check-updates", HTTP_POST, handleApiCheckUpdates);
   server.on("/api/upload-logs", HTTP_POST, handleApiUploadLogs);
   server.on("/api/debug-mode", HTTP_POST, handleApiDebugMode);
+  server.on("/api/scan-wifi", HTTP_GET, handleApiScanWifi);
+  server.on("/api/wifi-config", HTTP_POST, handleApiWifiConfig);
+  server.on("/setup", []() { server.send(200, "text/html", WIFI_SETUP_HTML); });
   
   server.begin();
   Serial.println("Web server started");
