@@ -1,3 +1,56 @@
-app_py/__pycache__/commands.cpython-311.pyc
-app_py/__pycache__/connection.cpython-311.pyc
-app_py/__pycache__/temperature.cpython-311.pyc
+# Временные файлы
+*.tmp
+*.temp
+*~
+
+# Логи
+*.log
+
+# Скомпилированные файлы
+*.o
+*.elf
+*.bin
+*.hex
+
+# Arduino IDE
+.arduino15/
+.vscode/
+*.ino.bak
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Локальные настройки
+config_local.json
+secrets.json
+
+# Логи пайки
+/logs/
+*.csv
+
+# Временные профили
+/presets/
+preset_temp.json
+
+# OTA файлы
+*.bin.ota
+
+# Старые файлы (уже в архиве)
+app_py/__pycache__/
