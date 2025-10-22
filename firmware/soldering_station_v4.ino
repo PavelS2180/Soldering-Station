@@ -37,6 +37,8 @@
 #include <time.h>
 #include <ArduinoOTA.h>
 #include <ArduinoJson.h>
+#include <HTTPClient.h>
+#include <Update.h>
 #include "max6675.h"
 
 // -------- Конфигурация GPIO (ОБНОВЛЕНО) --------
@@ -69,6 +71,20 @@ WebServer server(80);
 String wifiMode = "ap";
 String wifiSsid = "ZM-R5860";
 String wifiPass = "reflow123";
+
+// -------- GitHub интеграция --------
+const String GITHUB_OWNER = "PavelS2180";
+const String GITHUB_REPO = "Soldering-Station";
+const String GITHUB_TOKEN = ""; // Добавить токен для приватного репозитория
+const String GITHUB_API_URL = "https://api.github.com/repos/" + GITHUB_OWNER + "/" + GITHUB_REPO;
+const String FIRMWARE_VERSION = "4.0.0";
+
+// -------- Система логирования --------
+bool debugMode = true;
+bool githubLogging = true;
+String currentLogFile = "";
+uint32_t lastLogUpload = 0;
+const uint32_t LOG_UPLOAD_INTERVAL = 300000; // 5 минут
 
 // -------- NTP --------
 bool timeReady = false;
@@ -215,6 +231,192 @@ void setHeatingFansForCooling(float coolingRate = 2.0) {
   Serial.println("Cooling fans set for rate: " + String(coolingRate) + "°C/sec");
 }
 
+// -------- Система дебаг логирования --------
+void debugLog(String level, String message) {
+  if (!debugMode) return;
+  
+  String timestamp = "";
+  if (timeReady) {
+    time_t now = time(nullptr);
+    struct tm tmnow;
+    localtime_r(&now, &tmnow);
+    char buf[32];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tmnow);
+    timestamp = String(buf);
+  } else {
+    timestamp = String(millis());
+  }
+  
+  String logEntry = "[" + timestamp + "] [" + level + "] " + message;
+  
+  // Вывод в Serial
+  Serial.println(logEntry);
+  
+  // Запись в файл
+  if (currentLogFile.length() > 0) {
+    ensureFS();
+    fs::FS &fs = activeFS();
+    File logFile = fs.open(currentLogFile, FILE_APPEND);
+    if (logFile) {
+      logFile.println(logEntry);
+      logFile.close();
+    }
+  }
+}
+
+void debugInfo(String message) { debugLog("INFO", message); }
+void debugWarn(String message) { debugLog("WARN", message); }
+void debugError(String message) { debugLog("ERROR", message); }
+void debugDebug(String message) { debugLog("DEBUG", message); }
+
+// -------- Автоматическое обновление с GitHub --------
+bool checkForUpdates() {
+  if (WiFi.status() != WL_CONNECTED) {
+    debugWarn("No WiFi connection for update check");
+    return false;
+  }
+  
+  HTTPClient http;
+  String url = GITHUB_API_URL + "/releases/latest";
+  
+  http.begin(url);
+  if (GITHUB_TOKEN.length() > 0) {
+    http.addHeader("Authorization", "token " + GITHUB_TOKEN);
+  }
+  http.addHeader("User-Agent", "ZM-R5860-Firmware");
+  
+  int httpCode = http.GET();
+  if (httpCode == HTTP_CODE_OK) {
+    String payload = http.getString();
+    http.end();
+    
+    JsonDocument doc;
+    deserializeJson(doc, payload);
+    
+    String latestVersion = doc["tag_name"];
+    String downloadUrl = doc["assets"][0]["browser_download_url"];
+    
+    debugInfo("Latest version: " + latestVersion + ", Current: " + FIRMWARE_VERSION);
+    
+    if (latestVersion != FIRMWARE_VERSION) {
+      debugInfo("Update available! Downloading from: " + downloadUrl);
+      return downloadAndInstallUpdate(downloadUrl);
+    } else {
+      debugInfo("Firmware is up to date");
+      return false;
+    }
+  } else {
+    debugError("Failed to check for updates. HTTP code: " + String(httpCode));
+    http.end();
+    return false;
+  }
+}
+
+bool downloadAndInstallUpdate(String downloadUrl) {
+  HTTPClient http;
+  http.begin(downloadUrl);
+  if (GITHUB_TOKEN.length() > 0) {
+    http.addHeader("Authorization", "token " + GITHUB_TOKEN);
+  }
+  http.addHeader("User-Agent", "ZM-R5860-Firmware");
+  
+  int httpCode = http.GET();
+  if (httpCode == HTTP_CODE_OK) {
+    int contentLength = http.getSize();
+    debugInfo("Downloading update, size: " + String(contentLength) + " bytes");
+    
+    if (Update.begin(contentLength)) {
+      WiFiClient* stream = http.getStreamPtr();
+      size_t written = Update.writeStream(*stream);
+      
+      if (written == contentLength) {
+        debugInfo("Update downloaded successfully");
+        if (Update.end()) {
+          debugInfo("Update installed successfully, rebooting...");
+          beepSequence(5); // Сигнал об успешном обновлении
+          delay(1000);
+          ESP.restart();
+          return true;
+        } else {
+          debugError("Update installation failed");
+          Update.abort();
+        }
+      } else {
+        debugError("Download incomplete. Expected: " + String(contentLength) + ", Got: " + String(written));
+        Update.abort();
+      }
+    } else {
+      debugError("Update begin failed");
+    }
+  } else {
+    debugError("Failed to download update. HTTP code: " + String(httpCode));
+  }
+  
+  http.end();
+  return false;
+}
+
+// -------- Загрузка логов на GitHub --------
+bool uploadLogToGitHub(String logContent, String filename) {
+  if (!githubLogging || WiFi.status() != WL_CONNECTED) {
+    debugWarn("GitHub logging disabled or no WiFi");
+    return false;
+  }
+  
+  HTTPClient http;
+  String url = GITHUB_API_URL + "/contents/logs/" + filename;
+  
+  // Кодируем содержимое в base64
+  String encodedContent = base64::encode(logContent);
+  
+  JsonDocument doc;
+  doc["message"] = "Auto-uploaded log: " + filename;
+  doc["content"] = encodedContent;
+  
+  String jsonString;
+  serializeJson(doc, jsonString);
+  
+  http.begin(url);
+  http.addHeader("Authorization", "token " + GITHUB_TOKEN);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("User-Agent", "ZM-R5860-Firmware");
+  
+  int httpCode = http.PUT(jsonString);
+  if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_CREATED) {
+    debugInfo("Log uploaded to GitHub: " + filename);
+    http.end();
+    return true;
+  } else {
+    debugError("Failed to upload log. HTTP code: " + String(httpCode));
+    String response = http.getString();
+    debugError("Response: " + response);
+    http.end();
+    return false;
+  }
+}
+
+void uploadCurrentLog() {
+  if (currentLogFile.length() == 0) return;
+  
+  ensureFS();
+  fs::FS &fs = activeFS();
+  File logFile = fs.open(currentLogFile, FILE_READ);
+  
+  if (logFile) {
+    String logContent = logFile.readString();
+    logFile.close();
+    
+    // Извлекаем имя файла из пути
+    String filename = currentLogFile;
+    int lastSlash = filename.lastIndexOf('/');
+    if (lastSlash >= 0) {
+      filename = filename.substring(lastSlash + 1);
+    }
+    
+    uploadLogToGitHub(logContent, filename);
+  }
+}
+
 // -------- Звуковые сигналы --------
 void beep(int duration = 200) {
   for (int i = 0; i < duration / 10; i++) {
@@ -260,11 +462,24 @@ void openLog() {
   ensureFS();
   fs::FS &fs = activeFS();
   if (!fs.exists("/logs")) fs.mkdir("/logs");
+  
+  // Создаем основной лог процесса
   lastLogPath = getTimestampFilename();
   logFile = fs.open(lastLogPath, FILE_WRITE);
   if (logFile) {
     logFile.println("ms,phase,topC,bottomC,irC,externalC,outTop,outBottom,outIR,autotune");
   }
+  
+  // Создаем дебаг лог
+  String debugLogPath = "/logs/debug_" + String((uint32_t)millis()) + ".log";
+  currentLogFile = debugLogPath;
+  
+  debugInfo("=== SOLDERING STATION STARTED ===");
+  debugInfo("Firmware version: " + FIRMWARE_VERSION);
+  debugInfo("WiFi mode: " + wifiMode);
+  debugInfo("Current profile: " + currentPreset.name);
+  debugInfo("Debug logging enabled");
+  debugInfo("GitHub logging: " + String(githubLogging ? "enabled" : "disabled"));
 }
 
 void writeLogLine() {
@@ -285,6 +500,14 @@ void closeLog() {
   if (logFile) {
     logFile.flush();
     logFile.close();
+  }
+  
+  // Загружаем дебаг лог на GitHub
+  if (currentLogFile.length() > 0) {
+    debugInfo("=== SOLDERING STATION STOPPED ===");
+    debugInfo("Uploading debug log to GitHub...");
+    uploadCurrentLog();
+    currentLogFile = "";
   }
 }
 
@@ -401,6 +624,10 @@ void applyPhasePIDCoeffs() {
 }
 
 void startProcess() {
+  debugInfo("Starting soldering process");
+  debugInfo("Profile: " + currentPreset.name);
+  debugInfo("Phases: " + String(currentPreset.n));
+  
   runState = RUNNING;
   currentPhase = 0;
   procStartMs = phaseStartMs = millis();
@@ -415,7 +642,9 @@ void startProcess() {
   digitalWrite(PIN_LED, HIGH);
   openLog();
   beep();
-  Serial.println("Process started - fans set for phase: " + phase.name);
+  
+  debugInfo("Process started - Phase 1: " + phase.name);
+  debugInfo("Fan speeds - Top: " + String(phase.topFanSpeed) + "%, Bottom: " + String(phase.bottomFanSpeed) + "%");
 }
 
 void stopProcess(bool aborted) {
@@ -976,6 +1205,57 @@ void handleApiProfiles() {
   }
 }
 
+void handleApiCheckUpdates() {
+  debugInfo("Manual update check requested");
+  bool updateAvailable = checkForUpdates();
+  
+  JsonDocument doc;
+  doc["updateAvailable"] = updateAvailable;
+  doc["currentVersion"] = FIRMWARE_VERSION;
+  doc["status"] = updateAvailable ? "Update downloaded and installed" : "No updates available";
+  
+  String response;
+  serializeJson(doc, response);
+  server.send(200, "application/json", response);
+}
+
+void handleApiUploadLogs() {
+  debugInfo("Manual log upload requested");
+  uploadCurrentLog();
+  
+  JsonDocument doc;
+  doc["status"] = "Logs uploaded to GitHub";
+  doc["logFile"] = currentLogFile;
+  
+  String response;
+  serializeJson(doc, response);
+  server.send(200, "application/json", response);
+}
+
+void handleApiDebugMode() {
+  String body = server.arg("plain");
+  JsonDocument doc;
+  deserializeJson(doc, body);
+  
+  bool newDebugMode = doc["debugMode"];
+  bool newGithubLogging = doc["githubLogging"];
+  
+  debugMode = newDebugMode;
+  githubLogging = newGithubLogging;
+  
+  debugInfo("Debug mode: " + String(debugMode ? "enabled" : "disabled"));
+  debugInfo("GitHub logging: " + String(githubLogging ? "enabled" : "disabled"));
+  
+  JsonDocument response;
+  response["debugMode"] = debugMode;
+  response["githubLogging"] = githubLogging;
+  response["status"] = "Settings updated";
+  
+  String responseStr;
+  serializeJson(response, responseStr);
+  server.send(200, "application/json", responseStr);
+}
+
 // -------- OTA обновления --------
 void setupOTA() {
   ArduinoOTA.setHostname("ZM-R5860");
@@ -1078,6 +1358,9 @@ void setup() {
   server.on("/api/autotune", HTTP_POST, handleApiAutotune);
   server.on("/api/profiles", HTTP_GET, handleApiProfiles);
   server.on("/api/profiles", HTTP_POST, handleApiProfiles);
+  server.on("/api/check-updates", HTTP_POST, handleApiCheckUpdates);
+  server.on("/api/upload-logs", HTTP_POST, handleApiUploadLogs);
+  server.on("/api/debug-mode", HTTP_POST, handleApiDebugMode);
   
   server.begin();
   Serial.println("Web server started");
@@ -1090,6 +1373,25 @@ void loop() {
   server.handleClient();
   updateButtons();
   
+  // Автоматическая проверка обновлений каждые 30 минут
+  static uint32_t lastUpdateCheck = 0;
+  if (millis() - lastUpdateCheck > 1800000) { // 30 минут
+    lastUpdateCheck = millis();
+    if (WiFi.status() == WL_CONNECTED) {
+      debugInfo("Checking for automatic updates...");
+      checkForUpdates();
+    }
+  }
+  
+  // Автоматическая загрузка логов каждые 5 минут
+  if (millis() - lastLogUpload > LOG_UPLOAD_INTERVAL) {
+    lastLogUpload = millis();
+    if (githubLogging && currentLogFile.length() > 0) {
+      debugInfo("Auto-uploading logs to GitHub...");
+      uploadCurrentLog();
+    }
+  }
+  
   uint32_t now = millis();
 
   // Чтение температур
@@ -1101,10 +1403,20 @@ void loop() {
     tempExternal = tcExternal.readCelsius();
     
     // Проверка термопар
-    checkThermocouple(0, tempTop);
-    checkThermocouple(1, tempBottom);
-    checkThermocouple(2, tempIR);
-    checkThermocouple(3, tempExternal);
+    bool tc1OK = checkThermocouple(0, tempTop);
+    bool tc2OK = checkThermocouple(1, tempBottom);
+    bool tc3OK = checkThermocouple(2, tempIR);
+    bool tc4OK = checkThermocouple(3, tempExternal);
+    
+    // Дебаг логирование температур каждые 10 секунд
+    static uint32_t lastTempLog = 0;
+    if (now - lastTempLog > 10000) {
+      lastTempLog = now;
+      debugDebug("Temps - Top:" + String(tempTop, 1) + " Bottom:" + String(tempBottom, 1) + 
+                 " IR:" + String(tempIR, 1) + " Ext:" + String(tempExternal, 1));
+      debugDebug("TC Status - T1:" + String(tc1OK ? "OK" : "ERR") + " T2:" + String(tc2OK ? "OK" : "ERR") + 
+                 " T3:" + String(tc3OK ? "OK" : "ERR") + " T4:" + String(tc4OK ? "OK" : "ERR"));
+    }
   }
 
   // Обработка процесса пайки
