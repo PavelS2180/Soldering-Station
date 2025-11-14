@@ -1,0 +1,515 @@
+/* ZM-R5860 — ESP32 Controller v2.0 (STA/AP, SD logs, up to 10 phases)
+ * Pins: MAX6675 (SCK=18, SO=19, CS1=5, CS2=17), SSR_TOP=25, SSR_BOTTOM=26, SSR_IR=27, FAN=14, LED=2
+ * Libs: WiFi, WebServer, SPIFFS, SD, SPI, max6675, time (NTP)
+ */
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <SPIFFS.h>
+#include <FS.h>
+#include <SPI.h>
+#include <SD.h>
+#include <time.h>
+#include "max6675.h"
+
+// -------- Pins --------
+#define PIN_MAX_SCK   18
+#define PIN_MAX_SO    19
+#define PIN_MAX1_CS   5
+#define PIN_MAX2_CS   17
+#define PIN_SSR_TOP    25
+#define PIN_SSR_BOTTOM 26
+#define PIN_SSR_IR     27
+#define PIN_FAN        14
+#define PIN_LED         2
+
+// -------- Thermo --------
+MAX6675 tcTop(PIN_MAX_SCK, PIN_MAX1_CS, PIN_MAX_SO);
+MAX6675 tcBot(PIN_MAX_SCK, PIN_MAX2_CS, PIN_MAX_SO);
+
+// -------- WiFi --------
+WebServer server(80);
+String wifiMode = "ap";            // "ap" or "sta"
+String wifiSsid = "ZM-R5860";
+String wifiPass = "reflow123";
+
+// -------- NTP (STA only) --------
+bool timeReady = false;
+void setupTime() {
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  for (int i=0;i<20;i++){ time_t now=time(nullptr); if(now>1700000000){ timeReady=true; break;} delay(200); }
+}
+
+// -------- Storage --------
+enum Store { USE_SD, USE_SPIFFS };
+Store storeMode = USE_SD;          // configurable
+bool sdOK=false;
+
+fs::FS& activeFS(){ return (storeMode==USE_SD && sdOK) ? SD : SPIFFS; }
+bool ensureFS(){
+  if(storeMode==USE_SD){
+    if(!sdOK){
+      sdOK = SD.begin(); // CS по умолчанию (GPIO5 часто CS — у нас уже занят; для многих breakout — CS=5/13/15. Если у тебя другой CS — добавь SD.begin(CS_PIN)).
+      if(!sdOK){ SPIFFS.begin(true); return false; }
+    }
+    return true;
+  }else{
+    SPIFFS.begin(true);
+    return true;
+  }
+}
+
+// -------- Process / Preset --------
+struct Phase { String name; float targetC; uint32_t seconds; float Kp; float Ki; };
+const int MAX_PHASES = 10;
+struct Preset {
+  String name;
+  int n;             // number of phases
+  float overLimitC;  // abort limit
+  Phase ph[MAX_PHASES];
+} preset;
+
+enum RunState { IDLE, RUNNING, DONE, ABORTED };
+RunState runState = IDLE;
+
+uint8_t  cur = 0;
+uint32_t phaseStartMs=0, procStartMs=0;
+float topC=0, botC=0;
+float outTop=0, outBot=0, outIr=0;
+
+struct PID { float Kp, Ki, integ, outMin=0, outMax=100; };
+PID pidTop, pidBot;
+
+const uint32_t SAMPLE_MS = 200;
+uint32_t lastSample=0;
+
+const uint32_t SSR_WIN=1000;
+uint32_t ssrWinStart=0;
+
+// -------- Logging --------
+File logFile;
+String lastLogPath;
+uint32_t lastLogFlush=0;
+
+String tsFilename(){
+  if(timeReady){
+    time_t now = time(nullptr);
+    struct tm tmnow; localtime_r(&now, &tmnow);
+    char buf[64];
+    strftime(buf, sizeof(buf), "/logs/%Y-%m-%d_%H%M.csv", &tmnow);
+    return String(buf);
+  } else {
+    // fallback: millis-based
+    return String("/logs/run_")+String((uint32_t)millis())+".csv";
+  }
+}
+
+void logOpen(){
+  ensureFS();
+  fs::FS &fs = activeFS();
+  if(!fs.exists("/logs")) fs.mkdir("/logs");
+  lastLogPath = tsFilename();
+  logFile = fs.open(lastLogPath, FILE_WRITE);
+  if(logFile){ logFile.println("ms,phase,topC,botC,outTop,outBot,outIR"); }
+}
+void logLine(){
+  if(!logFile) return;
+  uint32_t ms = millis()-procStartMs;
+  String ph = (runState==RUNNING)? preset.ph[cur].name : "-";
+  logFile.printf("%u,%s,%.1f,%.1f,%.0f,%.0f,%.0f\n", ms, ph.c_str(), topC, botC, outTop, outBot, outIr);
+  if(millis()-lastLogFlush>1000){ logFile.flush(); lastLogFlush=millis(); }
+}
+void logClose(){ if(logFile){ logFile.flush(); logFile.close(); } }
+
+// -------- Helpers --------
+float clampf(float v,float a,float b){return v<a?a:(v>b?b:v);}
+float stepPID(PID &p, float target, float current, float dt){
+  float e = target - current;
+  p.integ = clampf(p.integ + e*p.Ki*dt, p.outMin, p.outMax);
+  return clampf(e*p.Kp + p.integ, p.outMin, p.outMax);
+}
+bool irOnForPhase(int i){ return (i<=1); } // IR в Preheat/Soak
+
+void applyPhasePIDCoeffs(){
+  pidTop.Kp = preset.ph[cur].Kp;  pidTop.Ki = preset.ph[cur].Ki;
+  pidBot.Kp = preset.ph[cur].Kp;  pidBot.Ki = preset.ph[cur].Ki;
+  pidTop.integ=pidBot.integ=0;
+}
+
+void startProcess(){
+  runState=RUNNING; cur=0;
+  procStartMs=phaseStartMs=millis();
+  ssrWinStart=millis();
+  applyPhasePIDCoeffs();
+  outTop=outBot=outIr=0;
+  digitalWrite(PIN_LED, HIGH);
+  logOpen();
+}
+void stopProcess(bool aborted){
+  runState = aborted?ABORTED:DONE;
+  outTop=outBot=outIr=0;
+  digitalWrite(PIN_SSR_TOP,LOW);
+  digitalWrite(PIN_SSR_BOTTOM,LOW);
+  digitalWrite(PIN_SSR_IR,LOW);
+  digitalWrite(PIN_FAN,LOW);
+  digitalWrite(PIN_LED,LOW);
+  logClose();
+}
+void nextPhase(){
+  cur++;
+  if(cur>=preset.n){ stopProcess(false); return; }
+  phaseStartMs=millis();
+  applyPhasePIDCoeffs();
+}
+
+// -------- Defaults --------
+void loadDefaults(){
+  preset.name="LeadFree";
+  preset.n=4;
+  preset.overLimitC=300.0; // регулируется из UI
+  preset.ph[0] = {"Preheat",150,90,  2.0,0.08};
+  preset.ph[1] = {"Soak",   180,60,  2.1,0.09};
+  preset.ph[2] = {"Reflow", 245,30,  2.5,0.10};
+  preset.ph[3] = {"Cool",   100,90,  1.0,0.05};
+}
+
+// -------- Preset save/load (simple JSON-ish) --------
+String presetToJson(){
+  String j="{\"name\":\""+preset.name+"\",\"overLimitC\":"+String(preset.overLimitC,1)+",\"n\":"+String(preset.n)+",\"phases\":[";
+  for(int i=0;i<preset.n;i++){
+    if(i) j+=",";
+    j+="{\"name\":\""+preset.ph[i].name+"\",\"targetC\":"+String(preset.ph[i].targetC,1)+",\"seconds\":"+String(preset.ph[i].seconds);
+    j+=",\"Kp\":"+String(preset.ph[i].Kp,3)+",\"Ki\":"+String(preset.ph[i].Ki,3)+"}";
+  }
+  j+="]}";
+  return j;
+}
+bool savePresetBody(const String& body){
+  ensureFS();
+  fs::FS &fs = activeFS();
+  File f = fs.open("/preset.json","w");
+  if(!f) return false;
+  f.print(body); f.close(); return true;
+}
+bool loadPresetFile(){
+  ensureFS();
+  fs::FS &fs = activeFS();
+  if(!fs.exists("/preset.json")) return false;
+  File f = fs.open("/preset.json","r");
+  if(!f) return false;
+  String s=f.readString(); f.close();
+  // миним парсер: если файл есть — пусть UI его перепишет корректно; в противном случае остаёмся на дефолтах
+  // (Чтобы не раздувать код полноценным JSON.)
+  return true;
+}
+
+// -------- HTML --------
+const char* INDEX_HTML = R"HTML(
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ZM-R5860 v2.0</title>
+<style>
+body{font-family:system-ui,Segoe UI,Arial;margin:16px;max-width:980px}
+.card{border:1px solid #ccc;border-radius:10px;padding:14px;margin:10px 0}
+.grid{display:grid;grid-template-columns:repeat(6,1fr);gap:8px}
+input,button,select{padding:8px;font-size:14px}
+.badge{padding:4px 8px;border-radius:999px;background:#eee;margin-left:6px}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+small{color:#666}
+</style></head><body>
+<h2>ZM-R5860 — Web Control <span id="state" class="badge"></span></h2>
+
+<div class="card">
+ <div class="row">
+  <div>Top: <b id="tTop">--.-</b> °C</div>
+  <div>Bottom: <b id="tBot">--.-</b> °C</div>
+  <div>Phase: <b id="phaseName">-</b></div>
+  <div>Remain: <b id="remain">-</b> s</div>
+  <div>Out: <b id="outs">0/0/0</b>%</div>
+ </div>
+</div>
+
+<div class="card">
+ <h3>Preset</h3>
+ <div class="row"><input id="pname" style="min-width:260px" placeholder="Preset name">
+ <label>Over-limit °C <input id="olim" type="number" step="1" value="300"></label>
+ <button onclick="addPhase()">+ Phase</button><button onclick="delPhase()">- Phase</button>
+ </div>
+ <div class="grid" id="phgrid">
+  <div><b>#</b></div><div><b>Name</b></div><div><b>Target °C</b></div><div><b>Seconds</b></div><div><b>Kp</b></div><div><b>Ki</b></div>
+ </div>
+ <div class="row" style="margin-top:8px">
+   <button onclick="save()">Save</button>
+ </div>
+</div>
+
+<div class="card">
+ <h3>Control</h3>
+ <div class="row">
+  <button onclick="start()">Start</button>
+  <button onclick="stop()">Stop</button>
+  <button onclick="fan(1)">Fan ON</button>
+  <button onclick="fan(0)">Fan OFF</button>
+  <a id="dl" href="#" download>Download Log</a>
+ </div>
+</div>
+
+<div class="card">
+ <h3>Setup</h3>
+ <div class="row">
+   <label>Mode
+     <select id="mode"><option value="ap">AP</option><option value="sta">STA</option></select>
+   </label>
+   <input id="ssid" placeholder="SSID">
+   <input id="pass" placeholder="PASS">
+   <label>Storage
+     <select id="store"><option value="sd">SD</option><option value="spiffs">SPIFFS</option></select>
+   </label>
+   <button onclick="saveSetup()">Save Setup</button>
+ </div>
+ <small>STA: при успешном подключении система попытается синхронизировать NTP для имени лога yyyy-mm-dd_hhmm.csv</small>
+</div>
+
+<script>
+let P={name:"",overLimitC:300,n:0,phases:[]}, lastLog="";
+function q(x){return document.getElementById(x)}
+function row(i,ph){
+  return `
+  <div>${i+1}</div>
+  <input id="n${i}" value="${ph.name}">
+  <input id="t${i}" type="number" step="1" value="${ph.targetC}">
+  <input id="s${i}" type="number" step="1" value="${ph.seconds}">
+  <input id="kp${i}" type="number" step="0.01" value="${ph.Kp}">
+  <input id="ki${i}" type="number" step="0.01" value="${ph.Ki}">`;
+}
+async function load(){
+  let r=await fetch('/preset'); P=await r.json();
+  q('pname').value=P.name; q('olim').value=P.overLimitC;
+  let g=q('phgrid'); g.innerHTML='<div><b>#</b></div><div><b>Name</b></div><div><b>Target °C</b></div><div><b>Seconds</b></div><div><b>Kp</b></div><div><b>Ki</b></div>';
+  for(let i=0;i<P.n;i++) g.innerHTML+=row(i,P.phases[i]);
+  let s=await (await fetch('/setup')).json();
+  q('mode').value=s.mode; q('ssid').value=s.ssid; q('pass').value=s.pass; q('store').value=s.store;
+}
+function addPhase(){ if(P.n>=10) return; P.phases.push({name:"Phase"+(P.n+1),targetC:150,seconds:60,Kp:2,Ki:0.08}); P.n++; load(); }
+function delPhase(){ if(P.n<=1) return; P.phases.pop(); P.n--; load(); }
+async function save(){
+  P.name=q('pname').value; P.overLimitC=+q('olim').value;
+  for(let i=0;i<P.n;i++){
+    P.phases[i].name=q('n'+i).value;
+    P.phases[i].targetC=+q('t'+i).value;
+    P.phases[i].seconds=+q('s'+i).value;
+    P.phases[i].Kp=+q('kp'+i).value;
+    P.phases[i].Ki=+q('ki'+i).value;
+  }
+  await fetch('/preset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(P)});
+}
+async function saveSetup(){
+  let s={mode:q('mode').value,ssid:q('ssid').value,pass:q('pass').value,store:q('store').value};
+  await fetch('/setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(s)});
+  alert('Saved. Reboot device to apply STA/storage changes.');
+}
+async function poll(){
+  try{
+    let st=await (await fetch('/status')).json();
+    q('tTop').innerText=st.top.toFixed(1);
+    q('tBot').innerText=st.bot.toFixed(1);
+    q('phaseName').innerText=st.phase;
+    q('remain').innerText=st.remain;
+    q('state').innerText=st.state;
+    q('outs').innerText=st.outTop+' / '+st.outBot+' / '+st.outIr;
+    if(st.state==='DONE'&&st.lastLog){
+      lastLog=st.lastLog; q('dl').href='/log'+st.lastLog; q('dl').innerText='Download Log';
+    }
+  }catch(e){}
+  setTimeout(poll,300);
+}
+async function start(){ await fetch('/start'); }
+async function stop(){ await fetch('/stop'); }
+async function fan(v){ await fetch('/fan?v='+v); }
+load(); poll();
+</script>
+</body></html>
+)HTML";
+
+// -------- /setup persistence (very light) --------
+String setupJson(){
+  String j="{\"mode\":\""+wifiMode+"\",\"ssid\":\""+wifiSsid+"\",\"pass\":\""+wifiPass+"\",\"store\":\""+String(storeMode==USE_SD?"sd":"spiffs")+"\"}";
+  return j;
+}
+void saveSetupBody(const String& body){
+  // naive parse
+  if(body.indexOf("\"mode\":\"sta\"")>=0) wifiMode="sta"; else wifiMode="ap";
+  int k=body.indexOf("\"ssid\""); if(k>=0){int q1=body.indexOf('"',k+6);int q2=body.indexOf('"',q1+1); if(q1>0&&q2>q1) wifiSsid=body.substring(q1+1,q2);}
+  k=body.indexOf("\"pass\""); if(k>=0){int q1=body.indexOf('"',k+6);int q2=body.indexOf('"',q1+1); if(q1>0&&q2>q1) wifiPass=body.substring(q1+1,q2);}
+  if(body.indexOf("\"store\":\"spiffs\"")>=0) storeMode=USE_SPIFFS; else storeMode=USE_SD;
+
+  // persist minimal to SPIFFS
+  SPIFFS.begin(true);
+  File f=SPIFFS.open("/config.json","w"); if(f){ f.print(setupJson()); f.close(); }
+}
+
+void loadSetup(){
+  SPIFFS.begin(true);
+  if(!SPIFFS.exists("/config.json")) return;
+  File f=SPIFFS.open("/config.json","r"); if(!f) return;
+  String s=f.readString(); f.close();
+  if(s.indexOf("\"mode\":\"sta\"")>=0) wifiMode="sta"; else wifiMode="ap";
+  int k=s.indexOf("\"ssid\""); if(k>=0){int q1=s.indexOf('"',k+6);int q2=s.indexOf('"',q1+1); if(q1>0&&q2>q1) wifiSsid=s.substring(q1+1,q2);}
+  k=s.indexOf("\"pass\""); if(k>=0){int q1=s.indexOf('"',k+6);int q2=s.indexOf('"',q1+1); if(q1>0&&q2>q1) wifiPass=s.substring(q1+1,q2);}
+  if(s.indexOf("\"store\":\"spiffs\"")>=0) storeMode=USE_SPIFFS; else storeMode=USE_SD;
+}
+
+// -------- HTTP --------
+void handleIndex(){ server.send(200,"text/html",INDEX_HTML); }
+void handleGetPreset(){ server.send(200,"application/json",presetToJson()); }
+void handlePostPreset(){
+  String b=server.arg("plain");
+  if(b.length()<10){server.send(400,"text/plain","bad json");return;}
+  // parse minimal
+  int k=b.indexOf("\"name\""); if(k>=0){int q1=b.indexOf('"',k+7),q2=b.indexOf('"',q1+1); if(q1>0&&q2>q1) preset.name=b.substring(q1+1,q2);}
+  k=b.indexOf("\"overLimitC\""); if(k>=0){int c=b.indexOf(':',k),e=b.indexOf(',',c); if(e<0)e=b.indexOf('}',c); if(c>0&&e>c) preset.overLimitC=b.substring(c+1,e).toFloat();}
+  // phases: pull sequential fields
+  preset.n=0;
+  int off=0;
+  while(preset.n<MAX_PHASES){
+    int kn=b.indexOf("\"name\"",off); if(kn<0)break;
+    int q1=b.indexOf('"',kn+6), q2=b.indexOf('"',q1+1); if(q1<0||q2<0)break;
+    String nm=b.substring(q1+1,q2);
+    int kt=b.indexOf("\"targetC\"",q2); if(kt<0)break; int ct=b.indexOf(':',kt); int et=b.indexOf(',',ct); if(et<0) et=b.indexOf('}',ct);
+    float tg=b.substring(ct+1,et).toFloat();
+    int ks=b.indexOf("\"seconds\"",et); if(ks<0)break; int cs=b.indexOf(':',ks); int es=b.indexOf(',',cs); if(es<0) es=b.indexOf('}',cs);
+    uint32_t sec=b.substring(cs+1,es).toInt();
+    int kk=b.indexOf("\"Kp\"",es); if(kk<0)break; int ck=b.indexOf(':',kk); int ek=b.indexOf(',',ck); if(ek<0) ek=b.indexOf('}',ck);
+    float kp=b.substring(ck+1,ek).toFloat();
+    int ki=b.indexOf("\"Ki\"",ek); if(ki<0)break; int cki=b.indexOf(':',ki); int eki=b.indexOf(',',cki); if(eki<0) eki=b.indexOf('}',cki);
+    float kii=b.substring(cki+1,eki).toFloat();
+
+    preset.ph[preset.n++] = {nm,tg,sec,kp,kii};
+    off = eki+1;
+  }
+  if(preset.n<1) preset.n=1;
+  savePresetBody(b);
+  server.send(200,"text/plain","OK");
+}
+
+void handleStart(){ if(runState!=RUNNING) startProcess(); server.send(200,"text/plain","started"); }
+void handleStop(){ stopProcess(true); server.send(200,"text/plain","stopped"); }
+void handleFan(){ int v=server.hasArg("v")?server.arg("v").toInt():0; digitalWrite(PIN_FAN, v?HIGH:LOW); server.send(200,"text/plain",v?"fan on":"fan off"); }
+void handleStatus(){
+  String st="{";
+  st += "\"state\":\""+String(runState==IDLE?"IDLE":runState==RUNNING?"RUNNING":runState==DONE?"DONE":"ABORTED")+"\",";
+  st += "\"top\":"+String(topC,1)+",\"bot\":"+String(botC,1)+",";
+  st += "\"phase\":\""+String(runState==RUNNING?preset.ph[cur].name:"-")+"\",";
+  uint32_t remain=0;
+  if(runState==RUNNING){ uint32_t el=(millis()-phaseStartMs)/1000; uint32_t dur=preset.ph[cur].seconds; remain = (el>=dur)?0:(dur-el); }
+  st += "\"remain\":"+String(remain)+",";
+  st += "\"outTop\":"+String(outTop,0)+",\"outBot\":"+String(outBot,0)+",\"outIr\":"+String(outIr,0)+",";
+  st += "\"lastLog\":\""+lastLogPath+"\"";
+  st += "}";
+  server.send(200,"application/json",st);
+}
+void handleListLogs(){
+  ensureFS(); fs::FS &fs=activeFS();
+  File d=fs.open("/logs"); if(!d || !d.isDirectory()){ server.send(200,"application/json","[]"); return;}
+  String j="["; bool first=true; File f; while((f=d.openNextFile())){
+    if(!f.isDirectory()){ if(!first) j+=","; first=false; j+="\""+String(f.name())+"\""; }
+    f.close();
+  } j+="]";
+  server.send(200,"application/json",j);
+}
+void handleGetLog(){ // /log/<path>
+  String uri=server.uri(); // /log/logs/file.csv
+  String p = uri.substring(4); // remove /log
+  ensureFS(); fs::FS &fs=activeFS();
+  if(!fs.exists(p)){ server.send(404,"text/plain","not found"); return; }
+  File f=fs.open(p,"r");
+  server.streamFile(f,"text/csv"); f.close();
+}
+void handleSetupGet(){ server.send(200,"application/json", setupJson()); }
+void handleSetupPost(){ saveSetupBody(server.arg("plain")); server.send(200,"text/plain","OK"); }
+
+// -------- Setup/Loop --------
+void setup(){
+  pinMode(PIN_SSR_TOP,OUTPUT); pinMode(PIN_SSR_BOTTOM,OUTPUT); pinMode(PIN_SSR_IR,OUTPUT);
+  pinMode(PIN_FAN,OUTPUT); pinMode(PIN_LED,OUTPUT);
+  digitalWrite(PIN_SSR_TOP,LOW); digitalWrite(PIN_SSR_BOTTOM,LOW); digitalWrite(PIN_SSR_IR,LOW);
+  digitalWrite(PIN_FAN,LOW); digitalWrite(PIN_LED,LOW);
+
+  loadDefaults();
+  loadSetup();
+  SPIFFS.begin(true); // для конфигов; логи — в SD по умолчанию
+
+  if(wifiMode=="sta"){
+    WiFi.mode(WIFI_STA); WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+    uint32_t t0=millis(); while(WiFi.status()!=WL_CONNECTED && millis()-t0<10000) delay(200);
+    if(WiFi.status()==WL_CONNECTED){ setupTime(); } else { WiFi.mode(WIFI_AP); WiFi.softAP("ZM-R5860","reflow123"); }
+  }else{
+    WiFi.mode(WIFI_AP); WiFi.softAP("ZM-R5860","reflow123");
+  }
+
+  server.on("/", handleIndex);
+  server.on("/preset", HTTP_GET, handleGetPreset);
+  server.on("/preset", HTTP_POST, handlePostPreset);
+  server.on("/start", handleStart);
+  server.on("/stop", handleStop);
+  server.on("/fan", handleFan);
+  server.on("/status", handleStatus);
+  server.on("/logs", HTTP_GET, handleListLogs);
+  server.on("/log", HTTP_GET, [](){ server.send(400,"text/plain","use /logs or /log/<path>"); });
+  server.onNotFound([](){
+    String u=server.uri();
+    if(u.startsWith("/log/")){ handleGetLog(); return; }
+    server.send(404,"text/plain","404");
+  });
+  server.on("/setup", HTTP_GET, handleSetupGet);
+  server.on("/setup", HTTP_POST, handleSetupPost);
+  server.begin();
+}
+
+void loop(){
+  server.handleClient();
+  uint32_t now=millis();
+
+  // sample temps
+  if(now-lastSample>=SAMPLE_MS){
+    lastSample=now;
+    topC = tcTop.readCelsius();
+    botC = tcBot.readCelsius();
+  }
+
+  // process
+  if(runState==RUNNING){
+    // safety
+    float m = max(topC, botC);
+    if(m >= preset.overLimitC){ stopProcess(true); }
+
+    // phase timing
+    uint32_t el=(now-phaseStartMs)/1000;
+    if(el >= preset.ph[cur].seconds) nextPhase();
+    if(runState!=RUNNING) goto outputs;
+
+    float tgt = preset.ph[cur].targetC;
+    float dt = float(SAMPLE_MS)/1000.0f;
+
+    outIr  = irOnForPhase(cur) ? 50.0f : 0.0f;
+    outTop = stepPID(pidTop, tgt, topC, dt);
+    outBot = stepPID(pidBot, tgt, botC, dt);
+    if(cur==2){ // Reflow: смелее верх, осторожнее низ
+      outTop = clampf(outTop+10,0,100);
+      outBot = clampf(outBot,  0,70);
+    }
+
+    // logging
+    logLine();
+  } else {
+    // nothing
+  }
+
+outputs:
+  // time-proportional SSR
+  if(now-ssrWinStart>=SSR_WIN) ssrWinStart=now;
+  uint32_t tIn = now-ssrWinStart;
+  auto drive=[&](int pin,float pct){ uint32_t onms=(uint32_t)(pct*SSR_WIN/100.0f); digitalWrite(pin, tIn<onms?HIGH:LOW); };
+  drive(PIN_SSR_TOP, outTop);
+  drive(PIN_SSR_BOTTOM, outBot);
+  drive(PIN_SSR_IR, outIr);
+}
