@@ -2,13 +2,13 @@
 #include <WiFiClient.h>
 #include <WiFiServer.h>
 #include <max6675.h>
-#include <PID_v1.h>
+#include <PID_v1_bc.h>
 #include <SD.h>
 #include <SPI.h>
 
 // WiFi настройки
-const char* ssid = "your_SSID";
-const char* password = "your_PASSWORD";
+const char* ssid = "PavelS";
+const char* password = "wersiya312";
 WiFiServer server(80);
 WiFiClient client;
 
